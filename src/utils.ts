@@ -184,7 +184,8 @@ export function newRender(
   width: number,
   height: number,
   zIndex?: number,
-  insertAfter?: HTMLElement
+  insertAfter?: HTMLElement,
+  container?: HTMLElement
 ) {
   const render = document.createElement('div');
   render.id = randomId(2, '-', 'ASSRendererRender-', 5);
@@ -202,7 +203,9 @@ export function newRender(
     render.style.zIndex = zIndex.toString();
   }
 
-  if (insertAfter) {
+  if (container) {
+    container.appendChild(render);
+  } else if (insertAfter) {
     insertAfter.after(render);
   } else {
     document.body.appendChild(render);
@@ -257,20 +260,36 @@ export function uuidgen() {
   });
 }
 
-export function parseAlpha(of: string) {
-  const a = `0x${of}`;
-  return parseInt(a, 16);
+export function parseAlpha(of?: string | number) {
+  if (of === undefined || of === null || of === '') return 0;
+  if (typeof of === 'number') return of;
+  const clean = of.toString().replace(/&H|&/gi, '');
+  return parseInt(clean, 16) || 0;
 }
 
 export function blendAlpha(color: string, alpha: number) {
-  color = color.replace('#', '');
-  // color = FFFFFF
-  // alpha = 0x80
-  // return rgba(255, 255, 255, 0.5)
-  const red = parseInt(color.substring(0, 2), 16);
-  const green = parseInt(color.substring(2, 4), 16);
-  const blue = parseInt(color.substring(4, 6), 16);
-  return `rgba(${red}, ${green}, ${blue}, ${alpha == 0 ? 1 : alpha / 255})`;
+  color = color ? color.replace('#', '') : '000000';
+  const red = parseInt(color.substring(0, 2), 16) || 0;
+  const green = parseInt(color.substring(2, 4), 16) || 0;
+  const blue = parseInt(color.substring(4, 6), 16) || 0;
+  // In ASS, alpha 0 = fully opaque (1), alpha 255 = fully transparent (0)
+  const a = Math.max(0, Math.min(1, (255 - alpha) / 255));
+  return `rgba(${red}, ${green}, ${blue}, ${a.toFixed(3)})`;
+}
+
+export function interpolateColor(color1: string, color2: string, t: number): string {
+  const c1Clean = (color1 || '#000000').replace('#', '');
+  const c2Clean = (color2 || '#000000').replace('#', '');
+  const r1 = parseInt(c1Clean.substring(0, 2), 16) || 0;
+  const g1 = parseInt(c1Clean.substring(2, 4), 16) || 0;
+  const b1 = parseInt(c1Clean.substring(4, 6), 16) || 0;
+  const r2 = parseInt(c2Clean.substring(0, 2), 16) || 0;
+  const g2 = parseInt(c2Clean.substring(2, 4), 16) || 0;
+  const b2 = parseInt(c2Clean.substring(4, 6), 16) || 0;
+  const r = Math.min(255, Math.max(0, Math.round(r1 + (r2 - r1) * t)));
+  const g = Math.min(255, Math.max(0, Math.round(g1 + (g2 - g1) * t)));
+  const b = Math.min(255, Math.max(0, Math.round(b1 + (b2 - b1) * t)));
+  return `#${r.toString(16).padStart(2, '0')}${g.toString(16).padStart(2, '0')}${b.toString(16).padStart(2, '0')}`;
 }
 
 export class Vector2 {
@@ -322,15 +341,15 @@ export function getOpacity(
   const fadeIn = startTime + fade.fadein;
   const fadeOut = endTime - fade.fadeout;
   if (time < fadeIn) {
-    let t = (time - startTime) / (fadeIn - startTime);
-    return lerp(0, 1, t);
+    let t = fadeIn > startTime ? (time - startTime) / (fadeIn - startTime) : 1;
+    return Math.max(0, Math.min(1, lerp(0, 1, t)));
   } else if (time >= fadeIn && time < fadeOut) {
     return 1;
   } else if (time >= fadeOut && time <= endTime) {
-    let t = (time - fadeOut) / (endTime - fadeOut);
-    return lerp(1, 0, t);
+    let t = endTime > fadeOut ? (time - fadeOut) / (endTime - fadeOut) : 1;
+    return Math.max(0, Math.min(1, lerp(1, 0, t)));
   } else {
-    return -1;
+    return 0;
   }
 }
 
@@ -360,19 +379,94 @@ export function getOpacityComplex(
   const t3 = startTime + fade.t3;
   const t4 = startTime + fade.t4;
 
+  let rawAlpha = fade.a1;
   if (time < t1) {
-    return fade.a1;
+    rawAlpha = fade.a1;
   } else if (time >= t1 && time < t2) {
-    let t = (time - t1) / (t2 - t1);
-    return lerp(fade.a1, fade.a2, t);
+    let t = t2 > t1 ? (time - t1) / (t2 - t1) : 1;
+    rawAlpha = lerp(fade.a1, fade.a2, t);
   } else if (time >= t2 && time < t3) {
-    return fade.a2;
+    rawAlpha = fade.a2;
   } else if (time >= t3 && time < t4) {
-    let t = (time - t3) / (t4 - t3);
-    return lerp(fade.a2, fade.a3, t);
-  } else if (time >= t4 && time <= endTime) {
-    return fade.a3;
+    let t = t4 > t3 ? (time - t3) / (t4 - t3) : 1;
+    rawAlpha = lerp(fade.a2, fade.a3, t);
   } else {
-    return -1;
+    rawAlpha = fade.a3;
+  }
+
+  return Math.max(0, Math.min(1, (255 - rawAlpha) / 255));
+}
+
+export interface FontMetrics {
+  unitsPerEm: number;
+  winAscent: number;
+  winDescent: number;
+  ratio: number;
+}
+
+/**
+ * Extract OpenType / TrueType font metrics (unitsPerEm, usWinAscent, usWinDescent)
+ * from a binary font ArrayBuffer to replicate VSFilter / libass font sizing.
+ *
+ * In libass / VSFilter, FontSize does not map to the EM-square directly.
+ * Instead, the font is scaled so that the cell height (usWinAscent + usWinDescent)
+ * matches the ASS FontSize. In CSS / Canvas 2D, font-size sets the EM-square.
+ * Therefore, CSS fontSize = ASS fontSize * (unitsPerEm / (usWinAscent + usWinDescent)).
+ */
+export function parseFontMetrics(buffer: ArrayBuffer): FontMetrics {
+  try {
+    const view = new DataView(buffer);
+    if (buffer.byteLength < 12) {
+      return { unitsPerEm: 1000, winAscent: 0, winDescent: 0, ratio: 1 };
+    }
+
+    const numTables = view.getUint16(4);
+    let headOffset = 0;
+    let os2Offset = 0;
+    let hheaOffset = 0;
+
+    for (let i = 0; i < numTables; i++) {
+      const offset = 12 + i * 16;
+      if (offset + 16 > buffer.byteLength) break;
+      const tag = String.fromCharCode(
+        view.getUint8(offset),
+        view.getUint8(offset + 1),
+        view.getUint8(offset + 2),
+        view.getUint8(offset + 3)
+      );
+      if (tag === 'head') headOffset = view.getUint32(offset + 8);
+      else if (tag === 'OS/2') os2Offset = view.getUint32(offset + 8);
+      else if (tag === 'hhea') hheaOffset = view.getUint32(offset + 8);
+    }
+
+    let unitsPerEm = 1000;
+    if (headOffset && headOffset + 20 <= buffer.byteLength) {
+      const upem = view.getUint16(headOffset + 18);
+      if (upem > 0) unitsPerEm = upem;
+    }
+
+    let winAscent = 0;
+    let winDescent = 0;
+    if (os2Offset && os2Offset + 78 <= buffer.byteLength) {
+      winAscent = view.getUint16(os2Offset + 74);
+      winDescent = view.getUint16(os2Offset + 76);
+    }
+
+    let cellHeight = winAscent + winDescent;
+    if (cellHeight === 0 && os2Offset && os2Offset + 72 <= buffer.byteLength) {
+      const typoAsc = view.getInt16(os2Offset + 68);
+      const typoDesc = view.getInt16(os2Offset + 70);
+      cellHeight = Math.abs(typoAsc) + Math.abs(typoDesc);
+    }
+    if (cellHeight === 0 && hheaOffset && hheaOffset + 8 <= buffer.byteLength) {
+      const asc = view.getInt16(hheaOffset + 4);
+      const desc = view.getInt16(hheaOffset + 6);
+      cellHeight = Math.abs(asc) + Math.abs(desc);
+    }
+
+    const ratio = cellHeight > 0 && unitsPerEm > 0 ? unitsPerEm / cellHeight : 1;
+    return { unitsPerEm, winAscent, winDescent, ratio };
+  } catch {
+    return { unitsPerEm: 1000, winAscent: 0, winDescent: 0, ratio: 1 };
   }
 }
