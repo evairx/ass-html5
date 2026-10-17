@@ -33,7 +33,8 @@ import {
   getOpacity,
   getOpacityComplex,
   lerp,
-  parseAlpha
+  parseAlpha,
+  interpolateColor
 } from './utils';
 
 type PreProceesedAss = {
@@ -83,74 +84,132 @@ export class Renderer {
   currentTime = 0;
   private occupiedRects: Map<number, Rect[]> = new Map();
   private lastActiveDialogueHashes: Map<number, string> = new Map();
+  private _nativeLetterSpacing?: boolean;
+  private fontRatios: Map<string, number> = new Map();
+
+  setFontRatios(ratios: Map<string, number>) {
+    this.fontRatios = ratios;
+    this.invalidate();
+  }
+
+  private getFontRatio(fontname: string): number {
+    if (this.fontRatios && this.fontRatios.size > 0) {
+      const clean = fontname
+        .trim()
+        .replace(/^["']|["']$/g, '')
+        .toLowerCase();
+      const base = clean
+        .replace(/\s+(semibold|bold|regular|light|medium|black|italic)/i, '')
+        .trim();
+      if (this.fontRatios.has(clean)) return this.fontRatios.get(clean)!;
+      if (this.fontRatios.has(base)) return this.fontRatios.get(base)!;
+      for (const [key, val] of this.fontRatios.entries()) {
+        if (clean.includes(key) || key.includes(clean)) return val;
+      }
+    }
+    // Typographic default for standard Windows GDI / TrueType fonts (Arial cell height ratio ≈ 0.895)
+    return 0.895;
+  }
+
+  private upscaleFontSize(fs: number, fontname: string): number {
+    const base = this.upscale(
+      fs,
+      this.playerResY,
+      this.layers[0]?.canvas.height || this.playerResY
+    );
+    return base * this.getFontRatio(fontname);
+  }
+
+  private supportsNativeLetterSpacing(ctx: CanvasRenderingContext2D): boolean {
+    if (this._nativeLetterSpacing !== undefined) return this._nativeLetterSpacing;
+    try {
+      if (typeof ctx.letterSpacing !== 'string') {
+        this._nativeLetterSpacing = false;
+        return false;
+      }
+      const saved = ctx.letterSpacing;
+      ctx.letterSpacing = '0px';
+      const w0 = ctx.measureText('M').width;
+      ctx.letterSpacing = '10px';
+      const w1 = ctx.measureText('M').width;
+      ctx.letterSpacing = saved;
+      this._nativeLetterSpacing = Math.abs(w1 - w0 - 10) < 0.1;
+      return this._nativeLetterSpacing;
+    } catch {
+      this._nativeLetterSpacing = false;
+      return false;
+    }
+  }
 
   constructor(
     ass: CompiledASS,
     sizes: OnInitSizes,
     video: HTMLVideoElement,
     log: LOGTYPE,
-    zIndex?: number
+    zIndex?: number,
+    fontRatios?: Map<string, number>,
+    container?: HTMLElement | null
   ) {
     this._log = log;
     this.compiledASS = ass;
     this.styles = ass.styles;
+    if (fontRatios) {
+      this.fontRatios = fontRatios;
+    }
     if (this._log === 'DEBUG') {
       this.log('DEBUG', this.compiledASS);
     }
-    this.playerResX = this.compiledASS.width;
-    this.playerResY = this.compiledASS.height;
-    this.renderDiv = newRender(sizes.y, sizes.x, sizes.width, sizes.height, zIndex, video);
-    const background = newCanvas(sizes.width, sizes.height, -1, 'background', this.renderDiv);
-    const bgCtx = background.getContext('2d') as CanvasRenderingContext2D;
-    if (bgCtx === null) {
+    const rawY = this.compiledASS.height || 0;
+    const rawX = this.compiledASS.width || 0;
+    if (rawX && rawY) {
+      this.playerResX = rawX;
+      this.playerResY = rawY;
+    } else if (rawY) {
+      this.playerResY = rawY;
+      this.playerResX = Math.round((rawY * 4) / 3);
+    } else if (rawX) {
+      this.playerResX = rawX;
+      this.playerResY = Math.round((rawX * 3) / 4);
+    } else {
+      this.playerResX = 384;
+      this.playerResY = 288;
+    }
+    this.renderDiv = newRender(
+      sizes.y,
+      sizes.x,
+      sizes.width,
+      sizes.height,
+      zIndex,
+      video,
+      container ?? undefined
+    );
+    const canvas = newCanvas(sizes.width, sizes.height, 0, 'subtitles', this.renderDiv);
+    const ctx = canvas.getContext('2d') as CanvasRenderingContext2D;
+    if (ctx === null) {
       throw new Error('Unable to initilize the Canvas 2D context');
     }
+    //@ts-ignore
+    ctx.textRendering = 'geometricPrecision';
+
     this.layers = [
       {
-        canvas: background,
-        ctx: bgCtx
+        canvas,
+        ctx
       }
     ];
 
-    this.numberOfLayers = this.findTotalLayers(ass);
-    this.insertLayers(sizes, background);
+    this.numberOfLayers = 1;
     this.video = video;
   }
 
-  private insertLayers(sizes: OnInitSizes, insertAfter: HTMLCanvasElement) {
-    for (let i = 0; i < this.numberOfLayers; i++) {
-      const canvas = newCanvas(sizes.width, sizes.height, i, 'frame', undefined, insertAfter);
-      const ctx = canvas.getContext('2d') as CanvasRenderingContext2D;
-      if (ctx === null) {
-        throw new Error('Unable to initilize the Canvas 2D context');
-      }
+  private insertLayers() {}
 
-      //@ts-ignore
-      ctx.textRendering = 'geometricPrecision';
-
-      this.layers.push({
-        canvas: canvas,
-        ctx: ctx
-      });
-    }
+  private getLayer(_l?: number): Layer | null {
+    return this.layers[0] || null;
   }
 
-  private getLayer(l: number): Layer | null {
-    for (let i = 1; i < this.layers.length; i++) {
-      if (this.layers[i]?.canvas.dataset.layer == l.toString()) {
-        return this.layers[i] as Layer;
-      }
-    }
-    return null;
-  }
-
-  private findTotalLayers(ass: CompiledASS) {
-    let maxLayer = 1;
-    ass.dialogues.forEach((dialogue) => {
-      if (dialogue.layer >= maxLayer) maxLayer++;
-    });
-
-    return maxLayer;
+  private findTotalLayers(_ass: CompiledASS) {
+    return 1;
   }
 
   async warmup() {
@@ -205,7 +264,11 @@ export class Renderer {
       const chars = this.processSlices(alignment, slices, computelayer);
       const isAnimated =
         !!(movAnim || fadeAnim) ||
-        chars.some((c) => c.kind === CHARKIND.NORMAL && ((c.tag as any).t || c.karaoke));
+        chars.some(
+          (c) =>
+            (c.kind === CHARKIND.NORMAL && (!!c.tag.t || !!c.karaoke)) ||
+            (c.kind === CHARKIND.DRAWING && !!c.tag.t)
+        );
 
       this.ppass.push({
         start,
@@ -280,7 +343,8 @@ export class Renderer {
           // However, ass-compiler usually returns drawing object only if valid.
           // But p0 disables drawing. So check scale != 0.
           if (scale > 0) {
-            const cachedPath = new Path2D(drawing.d);
+            const cachedPath =
+              typeof Path2D !== 'undefined' ? new Path2D(drawing.d) : ({} as Path2D);
             chars.push({
               kind: CHARKIND.DRAWING,
               pos: new Vector2(),
@@ -386,41 +450,48 @@ export class Renderer {
 
   destroy() {
     this.stop = true;
+    if (this.animationHandle) {
+      cancelAnimationFrame(this.animationHandle);
+    }
+    if ('hidePopover' in this.renderDiv && this.renderDiv.hasAttribute('popover')) {
+      try {
+        this.renderDiv.hidePopover();
+      } catch {}
+    }
+    this.renderDiv.remove();
   }
 
-  private display(time: number) {
+  forceRender(time?: number) {
+    this.display(time ?? this.video.currentTime, true);
+  }
+
+  private display(time: number, force = false) {
     this.currentTime = time;
     const slicesToDisplay = this.getSlices(time);
 
-    // Group by layer
-    const layerGroups = new Map<number, PreProceesedAss[]>();
-    slicesToDisplay.forEach((d) => {
-      const group = layerGroups.get(d.layer) || [];
-      group.push(d);
-      layerGroups.set(d.layer, group);
-    });
+    const hasAnimated = slicesToDisplay.some((d) => d.animated);
+    const dialogueIds = slicesToDisplay.map((d) => this.ppass.indexOf(d)).join(',');
+    const stateHash = hasAnimated ? `animated-${time}` : `static-${dialogueIds}`;
 
-    this.layers.forEach((layer, index) => {
-      const layerNum = parseInt(layer.canvas.dataset.layer || '-1');
-      if (layerNum === -1) return; // background
+    const lastHash = this.lastActiveDialogueHashes.get(0);
+    if (!force && stateHash === lastHash) {
+      return;
+    }
+    this.lastActiveDialogueHashes.set(0, stateHash);
 
-      const activeOnLayer = layerGroups.get(layerNum) || [];
+    const mainLayer = this.layers[0];
+    if (!mainLayer) return;
 
-      // Generate state hash for this layer
-      const hasAnimated = activeOnLayer.some((d) => d.animated);
-      const dialogueIds = activeOnLayer.map((d) => this.ppass.indexOf(d)).join(',');
-      const stateHash = hasAnimated ? `animated-${time}` : `static-${dialogueIds}`;
+    mainLayer.ctx.clearRect(0, 0, mainLayer.canvas.width, mainLayer.canvas.height);
+    if (slicesToDisplay.length === 0) return;
 
-      const lastHash = this.lastActiveDialogueHashes.get(layerNum);
+    // In ASS, dialogues are rendered in ascending layer order (layer 0 first, then 1, 2, ...).
+    // Stable sort preserves original script index for dialogues on the same layer.
+    const sorted = [...slicesToDisplay].sort((a, b) => a.layer - b.layer);
 
-      if (stateHash !== lastHash) {
-        this.clearLayer(index);
-        if (activeOnLayer.length > 0) {
-          this.occupiedRects.set(layerNum, []); // Reset collision rects for this layer
-          activeOnLayer.forEach((d) => this.showDialogue(d, time));
-        }
-        this.lastActiveDialogueHashes.set(layerNum, stateHash);
-      }
+    this.occupiedRects.clear();
+    sorted.forEach((d) => {
+      this.showDialogue(d, time);
     });
   }
 
@@ -438,24 +509,126 @@ export class Renderer {
     });
   }
 
-  private getLineMetrics(layer: Layer, lines: Char[][]) {
+  private applyCustomAnimations(font: StyleDescriptor, time?: number, startTime?: number) {
+    if (time === undefined || startTime === undefined || !font.customAnimations?.length) {
+      return;
+    }
+    const cur = time * 1000;
+    for (let i = 0; i < font.customAnimations.length; i++) {
+      const ca = font.customAnimations[i] as CustomAnimation;
+      const start = startTime * 1000 + ca.t1;
+      const end = startTime * 1000 + ca.t2;
+      if (cur < start) continue;
+      let t = end <= start ? 1 : Math.min(1, Math.max(0, (cur - start) / (end - start)));
+      if (ca.accel !== 1) {
+        t = Math.pow(t, ca.accel);
+      }
+
+      for (const field in ca.tag) {
+        switch (field) {
+          case 'a1':
+          case 'a2':
+          case 'a3':
+          case 'a4': {
+            const targetAlpha = parseAlpha((ca.tag as any)[field] as string);
+            const baseAlpha = font.colors[field] ?? 0;
+            font.colors[field] = Math.round(lerp(baseAlpha, targetAlpha, t));
+            break;
+          }
+          case 'c1':
+          case 'c2':
+          case 'c3':
+          case 'c4': {
+            const targetHex = swapBBGGRR((ca.tag as any)[field] as string);
+            const baseHex = font.colors[field] || '#000000';
+            font.colors[field] = interpolateColor(baseHex, targetHex, t);
+            break;
+          }
+          case 'blur':
+          case 'be':
+          case 'xshad':
+          case 'yshad':
+          case 'xbord':
+          case 'ybord':
+            font[field] = lerp(font[field] ?? 0, (ca.tag as any)[field] as number, t);
+            break;
+          case 'fax':
+          case 'fay':
+          case 'frx':
+          case 'fry':
+          case 'frz':
+            font.t[field] = lerp(font.t[field] ?? 0, (ca.tag as any)[field] as number, t);
+            break;
+          case 'fscx':
+          case 'fscy':
+            font.t[field] = lerp(font.t[field] ?? 100, (ca.tag as any)[field] as number, t);
+            break;
+          case 'fs': {
+            const targetFs = this.upscaleFontSize((ca.tag as any).fs as number, font.fontname);
+            font.fontsize = lerp(font.fontsize, targetFs, t);
+            break;
+          }
+          case 'fsp': {
+            const targetFsp = this.upscale(
+              (ca.tag as any).fsp as number,
+              this.playerResX,
+              this.layers[0]?.canvas.width || this.playerResX
+            );
+            font.t.fsp = lerp(font.t.fsp ?? 0, targetFsp, t);
+            break;
+          }
+          default:
+            break;
+        }
+      }
+    }
+  }
+
+  private resolveCharStyle(
+    char: Extract<Char, { style: string; tag: CompiledTag }>,
+    alignment: number,
+    layer: Layer,
+    time?: number,
+    startTime?: number
+  ): StyleDescriptor {
+    const font = this.computeStyle(char.style, alignment, layer);
+    this.applyOverrideTag(char.tag, font);
+    if (time !== undefined && startTime !== undefined) {
+      this.applyCustomAnimations(font, time, startTime);
+    }
+    return font;
+  }
+
+  private getLineMetrics(layer: Layer, lines: Char[][], time?: number, startTime?: number) {
     return lines.map((line) => {
       let maxAscent = 0;
       let maxDescent = 0;
 
       line.forEach((char) => {
         if (char.kind === CHARKIND.NORMAL) {
-          let font = this.computeStyle(char.style, 1, layer);
-          this.applyOverrideTag(char.tag, font);
+          let font = this.resolveCharStyle(char, 1, layer, time, startTime);
           this.applyFont(font, layer);
 
+          const scaleY = (font.t.fscy ?? 100) / 100;
+          const tiltY = font.t.frx ? Math.abs(Math.cos((font.t.frx * Math.PI) / 180)) : 1;
+          const totalScaleY = scaleY * tiltY;
+
           const m = layer.ctx.measureText(char.c);
-          if (m.fontBoundingBoxAscent > maxAscent) maxAscent = m.fontBoundingBoxAscent;
-          if (m.fontBoundingBoxDescent > maxDescent) maxDescent = m.fontBoundingBoxDescent;
+          const rawAscent =
+            m.fontBoundingBoxAscent || m.actualBoundingBoxAscent || font.fontsize * 0.8;
+          const rawDescent =
+            m.fontBoundingBoxDescent || m.actualBoundingBoxDescent || font.fontsize * 0.2;
+
+          const ascent = rawAscent * totalScaleY;
+          const descent = rawDescent * totalScaleY;
+
+          if (ascent > maxAscent) maxAscent = ascent;
+          if (descent > maxDescent) maxDescent = descent;
         } else if (char.kind === CHARKIND.DRAWING) {
           const Yratio = layer.canvas.height / this.playerResY;
           const pScale = Math.pow(2, -(char.scale - 1));
-          const fscy = (char.tag?.fscy ?? 100) / 100;
+          let font = this.resolveCharStyle(char, 1, layer, time, startTime);
+          const fscy = (font.t?.fscy ?? 100) / 100;
 
           const h = char.drawing.height * pScale * fscy * Yratio;
 
@@ -470,28 +643,89 @@ export class Renderer {
     });
   }
 
-  private measureChar(layer: Layer, char: Char): number {
+  private measureChar(layer: Layer, char: Char, time?: number, startTime?: number): number {
     if (char.kind === CHARKIND.NORMAL) {
-      let font = this.computeStyle(char.style, 1, layer);
-      this.applyOverrideTag(char.tag, font);
+      let font = this.resolveCharStyle(char, 1, layer, time, startTime);
       this.applyFont(font, layer);
-      return layer.ctx.measureText(char.c).width;
+      const scaleX = (font.t.fscx ?? 100) / 100;
+      const tiltX = font.t.fry ? Math.abs(Math.cos((font.t.fry * Math.PI) / 180)) : 1;
+      const totalScaleX = scaleX * tiltX;
+      const nativeLs = this.supportsNativeLetterSpacing(layer.ctx);
+      const spacing = nativeLs ? 0 : (font.t.fsp ?? 0) * totalScaleX;
+      return layer.ctx.measureText(char.c).width * totalScaleX + spacing;
     } else if (char.kind === CHARKIND.DRAWING) {
       return char.w;
     }
     return 0;
   }
 
-  private lineWidth(layer: Layer, chars: Char[]) {
+  private lineWidth(layer: Layer, chars: Char[], time?: number, startTime?: number) {
+    if (chars.length === 0) return 0;
+
     let w = 0;
+    let currentChunk: Char[] = [];
+    let currentHash: number | null = null;
+    let currentFont: StyleDescriptor | null = null;
+
+    const flushChunk = () => {
+      if (currentChunk.length === 0 || currentFont === null) return;
+      const head = currentChunk[0]!;
+      if (head.kind === CHARKIND.NORMAL) {
+        this.applyFont(currentFont, layer);
+        const str = currentChunk.map((c) => (c.kind === CHARKIND.NORMAL ? c.c : '')).join('');
+        const scaleX = (currentFont.t.fscx ?? 100) / 100;
+        const tiltX = currentFont.t.fry
+          ? Math.abs(Math.cos((currentFont.t.fry * Math.PI) / 180))
+          : 1;
+        const totalScaleX = scaleX * tiltX;
+        const fsp = (currentFont.t.fsp ?? 0) * totalScaleX;
+        if (this.supportsNativeLetterSpacing(layer.ctx)) {
+          w += layer.ctx.measureText(str).width * totalScaleX - (currentChunk.length > 0 ? fsp : 0);
+        } else {
+          w +=
+            layer.ctx.measureText(str).width * totalScaleX +
+            fsp * Math.max(0, currentChunk.length - 1);
+        }
+      } else if (head.kind === CHARKIND.DRAWING) {
+        currentChunk.forEach((c) => {
+          if (c.kind === CHARKIND.DRAWING) {
+            w += c.w;
+          }
+        });
+      }
+      currentChunk = [];
+    };
+
     chars.forEach((char) => {
-      w += this.measureChar(layer, char);
+      if (char.kind === CHARKIND.NORMAL) {
+        let font = this.resolveCharStyle(char, 1, layer, time, startTime);
+        const fHash = this.getFontHash(font);
+        if (currentHash !== fHash) {
+          flushChunk();
+          currentHash = fHash;
+          currentFont = font;
+        }
+        currentChunk.push(char);
+      } else if (char.kind === CHARKIND.DRAWING) {
+        flushChunk();
+        currentHash = null;
+        currentFont = null;
+        w += char.w;
+      }
     });
 
-    return w;
+    flushChunk();
+    return Math.max(0, w);
   }
 
-  private lines(chars: Char[], layer: Layer, q: number, maxWidth: number): Char[][] {
+  private lines(
+    chars: Char[],
+    layer: Layer,
+    q: number,
+    maxWidth: number,
+    time?: number,
+    startTime?: number
+  ): Char[][] {
     let lines: Char[][] = [];
     let currentLine: Char[] = [];
     let currentLineWidth = 0;
@@ -524,7 +758,7 @@ export class Renderer {
         continue;
       }
 
-      const charWidth = this.measureChar(layer, char);
+      const charWidth = this.measureChar(layer, char, time, startTime);
 
       // Check if we need to wrap
       if (currentLineWidth + charWidth > maxWidth && currentLine.length > 0) {
@@ -537,7 +771,7 @@ export class Renderer {
 
           currentLine = overflowChars;
           // Recalculate width for the new line start
-          currentLineWidth = this.lineWidth(layer, currentLine);
+          currentLineWidth = this.lineWidth(layer, currentLine, time, startTime);
           lastSafeBreakIndex = -1;
         } else {
           // No break point found
@@ -568,16 +802,14 @@ export class Renderer {
     if (d.clip) {
       let activeClip = d.clip;
       for (const char of d.chars) {
-        if (char.kind === CHARKIND.NORMAL && char.tag.t) {
+        if (char.kind !== CHARKIND.NEWLINE && char.tag.t) {
           for (const anim of char.tag.t) {
-            if (
-              (anim.tag as any).clip &&
-              d.start * 1000 + anim.t1 <= time * 1000 &&
-              time * 1000 <= d.start * 1000 + anim.t2
-            ) {
+            if ((anim.tag as any).clip) {
               const start = d.start * 1000 + anim.t1;
               const end = d.start * 1000 + anim.t2;
-              let t = (time * 1000 - start) / (end - start);
+              const cur = time * 1000;
+              if (cur < start) continue;
+              let t = end <= start ? 1 : Math.min(1, Math.max(0, (cur - start) / (end - start)));
               if (anim.accel !== 1) t = Math.pow(t, anim.accel);
 
               activeClip = this.interpolateClip(d.clip, (anim.tag as any).clip as Clip, t);
@@ -594,8 +826,8 @@ export class Renderer {
     const margin = this.upscaleMargin(d.margin);
     const maxWidth = layer.canvas.width - margin.left - margin.right;
 
-    const lines = this.lines(d.chars, layer, d.q, maxWidth);
-    const lineMetrics = this.getLineMetrics(layer, lines);
+    const lines = this.lines(d.chars, layer, d.q, maxWidth, time, d.start);
+    const lineMetrics = this.getLineMetrics(layer, lines, time, d.start);
     const totalHeight = lineMetrics.reduce((acc, m) => acc + m.height, 0);
 
     let cX = 0;
@@ -620,11 +852,22 @@ export class Renderer {
 
       let startPosition = new Vector2(d.move.from.x * Xratio, d.move.from.y * Yratio);
       let endPosition = new Vector2(d.move.to.x * Xratio, d.move.to.y * Yratio);
-      let actualPosition = vectorLerp(
-        startPosition,
-        endPosition,
-        (time - d.start) / (d.end - d.start)
-      );
+
+      const relTimeMs = (time - d.start) * 1000;
+      const moveStart = d.move.start ?? 0;
+      const moveEnd = d.move.end ?? (d.end - d.start) * 1000;
+      let moveProgress = 0;
+      if (moveEnd <= moveStart) {
+        moveProgress = 1;
+      } else if (relTimeMs <= moveStart) {
+        moveProgress = 0;
+      } else if (relTimeMs >= moveEnd) {
+        moveProgress = 1;
+      } else {
+        moveProgress = (relTimeMs - moveStart) / (moveEnd - moveStart);
+      }
+
+      let actualPosition = vectorLerp(startPosition, endPosition, moveProgress);
 
       baseX = actualPosition.x;
       cX = baseX;
@@ -726,7 +969,7 @@ export class Renderer {
     let words: Word[] = [];
 
     lines.forEach((line, lineIdx) => {
-      const lineWidth = this.lineWidth(layer, line);
+      const lineWidth = this.lineWidth(layer, line, time, d.start);
       let offsetX = 0;
 
       if (!customPosition) {
@@ -772,73 +1015,102 @@ export class Renderer {
 
       let currentWord: Char[] = [];
       let currentFont: StyleDescriptor | null = null;
-      let currentHash = 0;
+      let currentHash: number | null = null;
+
+      const flushWord = () => {
+        if (currentWord.length === 0 || currentFont === null) return;
+        const head = currentWord[0]!;
+        if (head.kind === CHARKIND.NORMAL) {
+          this.applyFont(currentFont, layer);
+          const str = currentWord.map((c) => (c.kind === CHARKIND.NORMAL ? c.c : '')).join('');
+          const scaleX = (currentFont.t.fscx ?? 100) / 100;
+          const tiltX = currentFont.t.fry
+            ? Math.abs(Math.cos((currentFont.t.fry * Math.PI) / 180))
+            : 1;
+          const totalScaleX = scaleX * tiltX;
+          const fsp = (currentFont.t.fsp ?? 0) * totalScaleX;
+          const nativeLs = this.supportsNativeLetterSpacing(layer.ctx);
+          const wordWidth = nativeLs
+            ? layer.ctx.measureText(str).width * totalScaleX - (currentWord.length > 0 ? fsp : 0)
+            : layer.ctx.measureText(str).width * totalScaleX +
+              fsp * Math.max(0, currentWord.length - 1);
+
+          for (let i = 0; i < currentWord.length; i++) {
+            const char = currentWord[i]!;
+            if (char.kind === CHARKIND.NORMAL) {
+              const prefix = str.slice(0, i);
+              let prefixWidth = 0;
+              if (i > 0) {
+                prefixWidth = nativeLs
+                  ? layer.ctx.measureText(prefix).width * totalScaleX
+                  : layer.ctx.measureText(prefix).width * totalScaleX + fsp * (i - 1);
+              }
+              char.pos.x = cX + prefixWidth;
+              char.pos.y = baseline;
+              const nextPrefix = str.slice(0, i + 1);
+              const nextPrefixWidth =
+                i === currentWord.length - 1
+                  ? wordWidth
+                  : nativeLs
+                    ? layer.ctx.measureText(nextPrefix).width * totalScaleX
+                    : layer.ctx.measureText(nextPrefix).width * totalScaleX + fsp * i;
+              char.w = nextPrefixWidth - prefixWidth;
+            }
+          }
+
+          words.push({
+            font: currentFont,
+            value: currentWord,
+            w: wordWidth
+          });
+
+          cX += wordWidth;
+        } else if (head.kind === CHARKIND.DRAWING) {
+          let dwTotal = 0;
+          currentWord.forEach((char) => {
+            if (char.kind === CHARKIND.DRAWING) {
+              char.pos.x = cX + dwTotal;
+              dwTotal += char.w;
+            }
+          });
+          words.push({
+            font: currentFont,
+            value: currentWord,
+            w: dwTotal
+          });
+          cX += dwTotal;
+        }
+        currentWord = [];
+      };
 
       line.forEach((char) => {
-        let charWidth = 0;
-
         if (char.kind === CHARKIND.NORMAL) {
-          char.pos.x = cX;
-          char.pos.y = baseline;
-
-          font = this.computeStyle(char.style, d.alignment, layer);
-          this.applyOverrideTag(char.tag, font);
-          this.applyFont(font, layer);
-          charWidth = layer.ctx.measureText(char.c).width;
-
-          char.w = charWidth;
-        } else if (char.kind === CHARKIND.DRAWING) {
-          char.pos.x = cX;
-
-          font = this.computeStyle(char.style, d.alignment, layer);
-          this.applyOverrideTag(char.tag, font);
-          const pScale = Math.pow(2, -(char.scale - 1));
-          const dw = char.drawing.width * pScale * Xratio;
-          const dh = char.drawing.height * pScale * Yratio;
-          charWidth = dw;
-
-          char.pos.y = baseline - dh;
-          char.w = charWidth;
-        }
-
-        cX += charWidth;
-
-        // Word Grouping (per line)
-        if (char.kind == CHARKIND.NORMAL || char.kind == CHARKIND.DRAWING) {
-          let fHash = this.getFontHash(font);
+          font = this.resolveCharStyle(char, d.alignment, layer, time, d.start);
+          const fHash = this.getFontHash(font);
           if (currentHash !== fHash) {
-            if (currentWord.length > 0) {
-              if (currentFont !== null) {
-                words.push({
-                  font: currentFont,
-                  value: currentWord,
-                  w: chunkCharWidth(currentWord)
-                });
-                currentWord = [char];
-                currentFont = font;
-                currentHash = fHash;
-              }
-            } else {
-              currentFont = font;
-              currentWord.push(char);
-              currentHash = fHash;
-            }
-          } else {
-            currentFont = font;
-            currentWord.push(char);
+            flushWord();
             currentHash = fHash;
+            currentFont = font;
           }
+          currentWord.push(char);
+        } else if (char.kind === CHARKIND.DRAWING) {
+          font = this.resolveCharStyle(char, d.alignment, layer, time, d.start);
+          const pScale = Math.pow(2, -(char.scale - 1));
+          const fscx = (font.t.fscx ?? 100) / 100;
+          const fscy = (font.t.fscy ?? 100) / 100;
+          char.w = char.drawing.width * pScale * fscx * Xratio;
+          const dh = char.drawing.height * pScale * fscy * Yratio;
+          char.pos.y = baseline - dh;
+
+          flushWord();
+          currentHash = null;
+          currentFont = font;
+          currentWord = [char];
+          flushWord();
         }
       });
 
-      // Flush last word of line
-      if (currentWord.length > 0 && currentFont !== null) {
-        words.push({
-          font: currentFont,
-          value: currentWord,
-          w: chunkCharWidth(currentWord)
-        });
-      }
+      flushWord();
     });
 
     words.forEach((word) => {
@@ -906,65 +1178,6 @@ export class Renderer {
 
   private drawWord(word: Word, time: number, startTime: number, layer: Layer, origin?: Vector2) {
     let str = chunkCharToString(word.value);
-    for (let i = 0; i < word.font.customAnimations.length; i++) {
-      const ca = word.font.customAnimations[i] as CustomAnimation;
-      if (startTime * 1000 + ca.t1 <= time * 1000 && time * 1000 <= startTime * 1000 + ca.t2) {
-        const end = startTime * 1000 + ca.t2;
-        const start = startTime * 1000 + ca.t1;
-        let t = (time * 1000 - start) / (end - start);
-        if (ca.accel !== 1) {
-          t = Math.pow(t, ca.accel);
-        }
-
-        for (const field in ca.tag) {
-          switch (field) {
-            case 'a1':
-            case 'a3':
-            case 'a4':
-              word.font.colors[field] = lerp(
-                255,
-                Math.abs(parseAlpha(ca.tag[field] as string) - 255),
-                t
-              );
-              break;
-            case 'blur':
-            case 'be':
-            case 'xshad':
-            case 'yshad':
-            case 'xbord':
-            case 'ybord':
-              word.font[field] = lerp(0, ca.tag[field] as number, t);
-              break;
-            case 'fax':
-            case 'fay':
-            case 'frx':
-            case 'fry':
-            case 'frz':
-            case 'fscx':
-            case 'fscy':
-              word.font.t[field] = lerp(0, ca.tag[field] as number, t);
-              break;
-            case 'fs':
-              word.font.fontsize = this.upscale(
-                lerp(0, ca.tag[field] as number, t),
-                this.playerResY,
-                this.layers[0]?.canvas.height || 0
-              );
-              break;
-            case 'fsp':
-              word.font.t.fsp = this.upscale(
-                lerp(0, ca.tag[field] as number, t),
-                this.playerResX,
-                this.layers[0]?.canvas.width || this.playerResX
-              );
-              break;
-            default:
-              break;
-          }
-        }
-      }
-    }
-
     this.applyFont(word.font, layer);
     const wordHead = word.value[0] as Char;
 
@@ -974,7 +1187,47 @@ export class Renderer {
     }
 
     if (wordHead.kind === CHARKIND.NORMAL) {
-      this.applyTransform(layer.ctx, word.font, wordHead.pos, origin);
+      const ctx = layer.ctx;
+      const t = word.font.t;
+
+      // Dialogue-level rotation around rotationOrigin
+      if (origin && (t.frz || t.fax || t.fay)) {
+        ctx.translate(origin.x, origin.y);
+        if (t.frz) ctx.rotate((-t.frz * Math.PI) / 180);
+        if (t.fax || t.fay) {
+          ctx.transform(1, t.fay || 0, -(t.fax || 0), 1, 0, 0);
+        }
+        ctx.translate(-origin.x, -origin.y);
+      }
+
+      // Glyph-level scaling & 3D tilt around alignment anchor point
+      const tiltX = t.fry ? Math.cos((t.fry * Math.PI) / 180) : 1;
+      const tiltY = t.frx ? Math.cos((t.frx * Math.PI) / 180) : 1;
+      const fscx = (t.fscx / 100) * tiltX;
+      const fscy = (t.fscy / 100) * tiltY;
+
+      if (Math.abs(fscx) < 0.001 || Math.abs(fscy) < 0.001) {
+        return;
+      }
+
+      let anchorX = wordHead.pos.x;
+      if (word.font.textAlign === Align.Center) {
+        anchorX = wordHead.pos.x + word.w / 2;
+      } else if (word.font.textAlign === Align.Right) {
+        anchorX = wordHead.pos.x + word.w;
+      }
+
+      let anchorY = wordHead.pos.y;
+      if (word.font.textBaseline === Baseline.Middle) {
+        anchorY = wordHead.pos.y - word.font.fontsize * 0.35;
+      } else if (word.font.textBaseline === Baseline.Top) {
+        anchorY = wordHead.pos.y - word.font.fontsize * 0.7;
+      }
+
+      ctx.translate(anchorX, anchorY);
+      ctx.scale(fscx, fscy);
+      ctx.translate(-anchorX, -anchorY);
+
       let hasKaraoke = false;
       let clipWidth = 0;
 
@@ -1005,54 +1258,78 @@ export class Renderer {
         });
       }
 
-      if (word.font.borderStyle !== 3) {
-        if (word.font.xbord !== 0 || word.font.ybord !== 0) {
-          layer.ctx.strokeText(str, wordHead.pos.x, wordHead.pos.y);
-        }
+      const hasBorder =
+        word.font.borderStyle !== 3 && (word.font.xbord !== 0 || word.font.ybord !== 0);
+
+      const avgScale = (Math.abs(fscx) + Math.abs(fscy)) / 2;
+      const savedLineWidth = ctx.lineWidth;
+      const savedShadowOffsetX = ctx.shadowOffsetX;
+      const savedShadowOffsetY = ctx.shadowOffsetY;
+
+      ctx.lineWidth = savedLineWidth / avgScale;
+      ctx.shadowOffsetX = savedShadowOffsetX / fscx;
+      ctx.shadowOffsetY = savedShadowOffsetY / fscy;
+
+      if (hasBorder) {
+        ctx.strokeText(str, wordHead.pos.x, wordHead.pos.y);
+        ctx.filter = 'none';
+        ctx.shadowColor = 'transparent';
       }
 
-      let metrics = layer.ctx.measureText(str);
+      let metrics = ctx.measureText(str);
 
       if (hasKaraoke) {
-        layer.ctx.save();
-        layer.ctx.fillStyle = blendAlpha(word.font.colors.c2, word.font.colors.a2);
-        layer.ctx.fillText(str, wordHead.pos.x, wordHead.pos.y);
-        layer.ctx.restore();
+        ctx.save();
+        ctx.fillStyle = blendAlpha(word.font.colors.c2, word.font.colors.a2);
+        ctx.fillText(str, wordHead.pos.x, wordHead.pos.y);
+        ctx.restore();
 
-        layer.ctx.save();
-        layer.ctx.beginPath();
-        layer.ctx.rect(
+        ctx.save();
+        ctx.beginPath();
+        const localClipWidth = clipWidth / fscx;
+        ctx.rect(
           wordHead.pos.x,
           wordHead.pos.y - layer.canvas.height,
-          clipWidth,
+          localClipWidth,
           layer.canvas.height * 2
         );
-        layer.ctx.clip();
+        ctx.clip();
 
-        layer.ctx.fillText(str, wordHead.pos.x, wordHead.pos.y);
-        layer.ctx.restore();
+        ctx.fillText(str, wordHead.pos.x, wordHead.pos.y);
+        ctx.restore();
       } else {
-        layer.ctx.fillText(str, wordHead.pos.x, wordHead.pos.y);
+        ctx.fillText(str, wordHead.pos.x, wordHead.pos.y);
       }
 
       if (word.font.underline) {
-        const y = wordHead.pos.y + metrics.emHeightDescent;
-        layer.ctx.fillRect(wordHead.pos.x, y, metrics.width, (layer.canvas.height * 0.2) / 100);
+        const y = wordHead.pos.y + (metrics.emHeightDescent || 2);
+        ctx.fillRect(
+          wordHead.pos.x,
+          y,
+          metrics.width,
+          (layer.canvas.height * 0.2) / 100 / Math.abs(fscy)
+        );
       }
       if (word.font.strikeout) {
-        const y = wordHead.pos.y - metrics.hangingBaseline / 2;
-        layer.ctx.shadowOffsetX = 0;
-        layer.ctx.shadowOffsetY = 0;
-        layer.ctx.fillRect(wordHead.pos.x, y, metrics.width, (layer.canvas.height * 0.2) / 100);
+        const y =
+          wordHead.pos.y - (metrics.hangingBaseline || metrics.actualBoundingBoxAscent || 10) / 2;
+        ctx.shadowOffsetX = 0;
+        ctx.shadowOffsetY = 0;
+        ctx.fillRect(
+          wordHead.pos.x,
+          y,
+          metrics.width,
+          (layer.canvas.height * 0.2) / 100 / Math.abs(fscy)
+        );
       }
 
       if (word.font.borderStyle === 3) {
-        this.drawTextBackground(
-          wordHead.pos,
-          metrics.actualBoundingBoxAscent + metrics.fontBoundingBoxDescent,
-          metrics.width,
-          word.font
-        );
+        ctx.save();
+        ctx.fillStyle = blendAlpha(word.font.colors.c4, word.font.colors.a4);
+        const boxH =
+          (metrics.actualBoundingBoxAscent || 20) + (metrics.fontBoundingBoxDescent || 5);
+        ctx.fillRect(wordHead.pos.x, wordHead.pos.y - boxH, metrics.width, boxH);
+        ctx.restore();
       }
     }
   }
@@ -1085,31 +1362,52 @@ export class Renderer {
 
     ctx.translate(pos.x, pos.y);
 
-    if (typeof DOMMatrix !== 'undefined' && 'addPath' in Path2D.prototype) {
+    if (
+      typeof DOMMatrix !== 'undefined' &&
+      typeof Path2D !== 'undefined' &&
+      'addPath' in Path2D.prototype
+    ) {
       try {
-        const matrix = new DOMMatrix().scale(sx, sy);
+        const matrix = new DOMMatrix()
+          .scale(sx, sy)
+          .translate(-char.drawing.minX, -char.drawing.minY);
 
         const scaledPath = new Path2D();
         scaledPath.addPath(path, matrix);
+        const hasBorder = (font.xbord ?? 0) > 0 || (font.ybord ?? 0) > 0;
+        if (hasBorder) {
+          ctx.stroke(scaledPath);
+          ctx.filter = 'none';
+          ctx.shadowColor = 'transparent';
+        }
         ctx.fill(scaledPath);
-        if ((font.xbord ?? 0) > 0 || (font.ybord ?? 0) > 0) ctx.stroke(scaledPath);
       } catch (e) {
-        this.fallbackDraw(ctx, path, sx, sy);
+        this.fallbackDraw(ctx, path, sx, sy, char.drawing.minX, char.drawing.minY);
       }
     } else {
-      this.fallbackDraw(ctx, path, sx, sy);
+      this.fallbackDraw(ctx, path, sx, sy, char.drawing.minX, char.drawing.minY);
     }
 
     ctx.restore();
   }
 
-  private fallbackDraw(ctx: CanvasRenderingContext2D, path: Path2D, sx: number, sy: number) {
+  private fallbackDraw(
+    ctx: CanvasRenderingContext2D,
+    path: Path2D,
+    sx: number,
+    sy: number,
+    minX = 0,
+    minY = 0
+  ) {
     ctx.scale(sx, sy);
+    ctx.translate(-minX, -minY);
+    const hasBorder = ctx.lineWidth > 0;
+    if (hasBorder) {
+      ctx.stroke(path);
+      ctx.filter = 'none';
+      ctx.shadowColor = 'transparent';
+    }
     ctx.fill(path);
-    // NOTE: ctx.scale WILL distort the border thickness here.
-    // e.g. a vertical line might have a thicker border than a horizontal one
-    // if sx != sy.
-    if (ctx.lineWidth > 0) ctx.stroke(path);
   }
 
   private applyTransform(
@@ -1147,25 +1445,28 @@ export class Renderer {
     const layer = this.layers[0] as Layer;
     layer.ctx.save();
     layer.ctx.beginPath();
-    layer.ctx.fillStyle = font.colors.c2;
+    layer.ctx.fillStyle = blendAlpha(font.colors.c4, font.colors.a4);
     layer.ctx.fillRect(pos.x, pos.y - height, width, height);
     layer.ctx.closePath();
     layer.ctx.restore();
   }
 
-  private clearLayer(layer: number) {
-    this.layers[layer]?.ctx.clearRect(
+  private clearLayer(_layer?: number) {
+    this.layers[0]?.ctx.clearRect(
       0,
       0,
-      this.layers[layer]?.canvas.width as number,
-      this.layers[layer]?.canvas.height as number
+      this.layers[0]?.canvas.width as number,
+      this.layers[0]?.canvas.height as number
     );
   }
 
   clear() {
-    this.layers.forEach((layer) => {
-      layer.ctx.clearRect(0, 0, layer.canvas.width, layer.canvas.height);
-    });
+    this.layers[0]?.ctx.clearRect(
+      0,
+      0,
+      this.layers[0]?.canvas.width as number,
+      this.layers[0]?.canvas.height as number
+    );
   }
 
   /**
@@ -1197,14 +1498,15 @@ export class Renderer {
   }
 
   private applyOverrideTag(tag: CompiledTag, font: StyleDescriptor) {
-    if (tag.b !== undefined) font.bold = tag.b === 1;
-    if (tag.i !== undefined) font.italic = tag.i === 1;
-    if (tag.u !== undefined) font.underline = tag.u === 1;
-    if (tag.s !== undefined) font.strikeout = tag.s === 1;
+    if (tag.b !== undefined) {
+      font.bold = tag.b === 1 || (tag.b as any) === -1 || (typeof tag.b === 'number' && tag.b > 1);
+    }
+    if (tag.i !== undefined) font.italic = tag.i === 1 || (tag.i as any) === -1;
+    if (tag.u !== undefined) font.underline = tag.u === 1 || (tag.u as any) === -1;
+    if (tag.s !== undefined) font.strikeout = tag.s === 1 || (tag.s as any) === -1;
     if (tag.fn !== undefined) font.fontname = tag.fn;
     if (tag.q !== undefined) font.t.q = tag.q;
-    if (tag.fs !== undefined)
-      font.fontsize = this.upscale(tag.fs, this.playerResY, this.layers[0]?.canvas.height || 0);
+    if (tag.fs !== undefined) font.fontsize = this.upscaleFontSize(tag.fs, font.fontname);
     if (tag.fscx !== undefined) font.t.fscx = tag.fscx;
     if (tag.fscy !== undefined) font.t.fscy = tag.fscy;
     if (tag.frz !== undefined) font.t.frz = tag.frz;
@@ -1223,9 +1525,11 @@ export class Renderer {
     if (tag.t !== undefined) font.customAnimations = tag.t;
 
     if (tag.c1 !== undefined) font.colors.c1 = swapBBGGRR(tag.c1);
+    if (tag.c2 !== undefined) font.colors.c2 = swapBBGGRR(tag.c2);
     if (tag.c3 !== undefined) font.colors.c3 = swapBBGGRR(tag.c3);
     if (tag.c4 !== undefined) font.colors.c4 = swapBBGGRR(tag.c4);
     if (tag.a1 !== undefined) font.colors.a1 = parseAlpha(tag.a1);
+    if (tag.a2 !== undefined) font.colors.a2 = parseAlpha(tag.a2);
     if (tag.a3 !== undefined) font.colors.a3 = parseAlpha(tag.a3);
     if (tag.a4 !== undefined) font.colors.a4 = parseAlpha(tag.a4);
     if (tag.xshad !== undefined) font.xshad = tag.xshad;
@@ -1241,18 +1545,84 @@ export class Renderer {
   }
 
   private fontDecriptorString(font: StyleDescriptor) {
-    return `${font.bold ? 'bold ' : ''}${font.italic ? 'italic ' : ''}${font.fontsize.toFixed(
-      3
-    )}px "${font.fontname}"`;
+    const weight = font.bold ? 'bold ' : '';
+    const style = font.italic ? 'italic ' : '';
+    const cleanFontname = font.fontname.trim().replace(/^["']|["']$/g, '');
+    const cleanName = cleanFontname
+      .replace(/\s+(semibold|bold|regular|light|medium|black|italic)/i, '')
+      .trim();
+    const fallbacks =
+      cleanName.toLowerCase() !== cleanFontname.toLowerCase()
+        ? `"${cleanFontname}", "${cleanName}", Arial, sans-serif`
+        : `"${cleanFontname}", Arial, sans-serif`;
+    return `${style}${weight}${font.fontsize.toFixed(3)}px ${fallbacks}`;
   }
 
   private computeStyle(name: string, alignment: number, layer: Layer): StyleDescriptor {
-    const style = this.styles[name] as CompiledASSStyle;
+    let style = this.styles[name] as CompiledASSStyle | undefined;
     if (style === undefined) {
       // TODO: fallbackFont when there is no style
       // Fallbacks most of the time to Arial
       this.log('WARN', `[ass-html5:renderer] no corresponding style "${name}" found`);
     }
+
+    const defaultStyle: CompiledASSStyle = {
+      style: {
+        Name: 'Default',
+        Fontname: 'Arial',
+        Fontsize: 20,
+        PrimaryColour: '&H00FFFFFF&',
+        SecondaryColour: '&H000000FF&',
+        OutlineColour: '&H00000000&',
+        BackColour: '&H00000000&',
+        Bold: 0,
+        Italic: 0,
+        Underline: 0,
+        StrikeOut: 0,
+        ScaleX: 100,
+        ScaleY: 100,
+        Spacing: 0,
+        Angle: 0,
+        BorderStyle: 1,
+        Outline: 2,
+        Shadow: 2,
+        Alignment: 2,
+        MarginL: 10,
+        MarginR: 10,
+        MarginV: 10,
+        Encoding: 1
+      },
+      tag: {
+        fn: 'Arial',
+        fs: 20,
+        c1: 'FFFFFF',
+        a1: '00',
+        c2: '0000FF',
+        a2: '00',
+        c3: '000000',
+        a3: '00',
+        c4: '000000',
+        a4: '00',
+        b: 0,
+        i: 0,
+        u: 0,
+        s: 0,
+        fscx: 100,
+        fscy: 100,
+        fsp: 0,
+        frz: 0,
+        xbord: 2,
+        ybord: 2,
+        xshad: 2,
+        yshad: 2,
+        fe: 1,
+        q: 2
+      }
+    };
+
+    const resolvedStyle: CompiledASSStyle =
+      style || this.styles['Default'] || Object.values(this.styles)[0] || defaultStyle;
+
     const {
       fn, // font name
       fs, // font size
@@ -1275,22 +1645,28 @@ export class Renderer {
       yshad, // y shadow
       fe, // font encoding
       q // wrap style
-    } = style.tag;
+    } = resolvedStyle.tag;
 
-    const { PrimaryColour, OutlineColour, SecondaryColour, BorderStyle } = style.style;
+    const { PrimaryColour, OutlineColour, SecondaryColour, BackColour, BorderStyle } =
+      resolvedStyle.style;
+
+    const isBold = b === 1 || (b as any) === -1 || (typeof b === 'number' && b > 1);
+    const isItalic = i === 1 || (i as any) === -1;
+    const isUnderline = u === 1 || (u as any) === -1;
+    const isStrikeout = s === 1 || (s as any) === -1;
 
     const font: StyleDescriptor = {
-      fontsize: this.upscale(fs, this.playerResY, this.layers[0]?.canvas.height || this.playerResY),
+      fontsize: this.upscaleFontSize(fs, fn),
       fontname: fn,
-      bold: b === 1,
-      italic: i === 1,
-      underline: u === 1,
-      strikeout: s === 1,
+      bold: isBold,
+      italic: isItalic,
+      underline: isUnderline,
+      strikeout: isStrikeout,
       colors: {
         c1: convertAegisubColorToHex(PrimaryColour),
         c2: convertAegisubColorToHex(SecondaryColour),
         c3: convertAegisubColorToHex(OutlineColour),
-        c4,
+        c4: c4 ? swapBBGGRR(c4) : BackColour ? convertAegisubColorToHex(BackColour) : '#000000',
         a1: parseAlpha(a1),
         a2: parseAlpha(a2),
         a3: parseAlpha(a3),
@@ -1347,12 +1723,19 @@ export class Renderer {
     layer.ctx.lineJoin = 'round';
     layer.ctx.globalAlpha = font.opacity;
 
-    const blurRadius = this.upscale(
-      font.blur + font.be,
-      this.playerResY,
-      this.layers[0]?.canvas.height || this.playerResY
-    );
-    layer.ctx.filter = blurRadius > 0 ? `blur(${blurRadius.toFixed(3)}px)` : 'none';
+    // libass: \blur sigma = blur * scale * 2/sqrt(ln 256) ≈ 0.8493218
+    const blurSigma =
+      font.blur > 0
+        ? this.upscale(
+            font.blur,
+            this.playerResY,
+            this.layers[0]?.canvas.height || this.playerResY
+          ) * 0.8493218
+        : 0;
+    // \be is edge-blur in output pixels, unscaled: sigma ≈ sqrt(N / 2)
+    const beSigma = font.be > 0 ? Math.sqrt(font.be / 2) : 0;
+    const totalSigma = Math.hypot(blurSigma, beSigma);
+    layer.ctx.filter = totalSigma > 0 ? `blur(${totalSigma.toFixed(3)}px)` : 'none';
   }
 
   private getAlignment(alignment: number) {
